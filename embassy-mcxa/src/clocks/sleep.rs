@@ -16,7 +16,20 @@ use crate::pac::scg::{Sircvld, SpllLock};
 /// Attempt to go to deep sleep if possible.
 ///
 /// If we successfully went and returned from deep sleep, this function returns a `true`.
-/// If we were unsuccessful due to active `WaitGuard`s, this function returns a `false`.
+/// If we were unsuccessful due to active `WakeGuard`s, this function returns a `false`.
+///
+/// The caller is responsible for tearing down any active-mode-only peripheral
+/// (LPUART, LPI2C, LPSPI, ADC, CTIMER, ...) *before* calling this so its
+/// `WakeGuard` is dropped; while any guard is live this function refuses and
+/// returns `false`. Register/SRAM state is retained across MCX-A Deep Sleep and
+/// the active-only root clocks are restarted on wake, so peripherals that remain
+/// live resume automatically — but they also keep their guard and block sleep.
+///
+/// A wake source that operates in Deep Sleep must be armed. The OS Event Timer
+/// runs from `clk_1m`/SIRC while `SIRCCSR[SIRCSTEN] = 1` (which the clock tree
+/// sets when SIRC is configured `AlwaysEnabled`), so any pending `embassy-time`
+/// timer will wake the core; WUU pin sources may also be used for external
+/// events.
 ///
 /// ## SAFETY
 ///
@@ -30,37 +43,6 @@ pub unsafe fn deep_sleep_if_possible(cs: &CriticalSection) -> bool {
         return false;
     }
 
-    unsafe { deep_sleep_forced(cs) }
-}
-
-/// Attempt to go to deep sleep, ignoring active `WakeGuard`s.
-///
-/// This behaves like [`deep_sleep_if_possible`] but does **not** abort when wake
-/// guards are held: it always performs the deep-sleep enter/recover sequence and
-/// returns `true`.
-///
-/// ## SAFETY
-///
-/// In addition to every requirement of [`deep_sleep_if_possible`]
-/// (`crate::clocks::init()` must have run with a `CoreSleep::DeepSleep`
-/// configuration), the caller asserts that it is safe to stop every
-/// active-mode-only clock *right now*:
-///
-/// * All guard-holding peripherals (LPUART, LPI2C, LPSPI, ADC, CTIMER, ...)
-///   must be idle. Their register and SRAM state is retained across MCX-A Deep
-///   Sleep and the active-only root clocks are restarted on wake, so they
-///   resume automatically — but any transfer in flight when the clock stops
-///   will be corrupted.
-/// * A wake source that operates in Deep Sleep must be armed. The OS Event
-///   Timer runs from `clk_1m`/SIRC while `SIRCCSR[SIRCSTEN] = 1` (which the
-///   clock tree sets when SIRC is configured `AlwaysEnabled`), so any pending
-///   `embassy-time` timer will wake the core; WUU pin sources may also be used
-///   for external events.
-///
-/// Ignoring the guards deliberately defeats the safety mechanism that otherwise
-/// prevents deep sleep while peripherals still need their clocks. Only call this
-/// from a context that guarantees system quiescence (e.g. the OS is asleep).
-pub unsafe fn deep_sleep_forced(cs: &CriticalSection) -> bool {
     unsafe {
         // Ready the system for deep sleep WHILE STILL IN the CS.
         setup_deep_sleep();
@@ -72,7 +54,7 @@ pub unsafe fn deep_sleep_forced(cs: &CriticalSection) -> bool {
 
         // Wakey wakey, eggs and bakey
         recover_deep_sleep(cs);
-        }
+    }
 
     true
 }

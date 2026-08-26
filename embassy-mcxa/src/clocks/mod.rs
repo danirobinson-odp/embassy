@@ -53,7 +53,7 @@ mod types;
 // Re-exports
 pub use config::VddLevel;
 pub use gate::{Gate, assert_reset, disable, enable, enable_and_reset, is_reset_released, release_reset};
-pub use sleep::{deep_sleep_forced, deep_sleep_if_possible};
+pub use sleep::deep_sleep_if_possible;
 pub use types::{Clock, ClockError, Clocks, PoweredClock, WakeGuard};
 
 //
@@ -151,6 +151,18 @@ pub fn with_clocks<R: 'static, F: FnOnce(&Clocks) -> R>(f: F) -> Option<R> {
         let c = c.as_ref()?;
         Some(f(c))
     })
+}
+
+/// Number of currently-live [`WakeGuard`]s (high-power tokens).
+///
+/// Diagnostic read of the guard count that
+/// [`deep_sleep_if_possible`](crate::clocks::deep_sleep_if_possible) consults:
+/// a non-zero count is exactly what makes deep sleep refuse. Unlike
+/// [`active_wake_guards`] this returns the raw count so callers can log *how
+/// many* holders remain. `Relaxed` is fine for a diagnostic snapshot.
+#[inline(always)]
+pub fn wake_guard_count() -> usize {
+    LIVE_HP_TOKENS.load(Ordering::Relaxed)
 }
 
 /// Are there active `WakeGuard`s?

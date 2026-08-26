@@ -77,6 +77,11 @@ pub mod trng;
 #[cfg(mcxa_wwdt)]
 pub mod wwdt;
 
+/// Wake-Up Unit (WUU) pin wake sources for Deep Sleep. Register layout is taken
+/// from the MCX-A5xx PAC metadata; gated to that chip family.
+#[cfg(feature = "mcxa5xx")]
+pub mod wuu;
+
 #[cfg(feature = "mcxa2xx")]
 pub use mcxa2xx_exclusive::*;
 #[cfg(feature = "mcxa5xx")]
