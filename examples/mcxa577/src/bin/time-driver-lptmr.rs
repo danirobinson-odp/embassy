@@ -4,9 +4,10 @@
 //! `cargo run --release --features time-driver-lptmr --bin time-driver-lptmr`
 //!
 //! Two tasks use independent deadlines. The short waits replace an outstanding
-//! long alarm without resetting the LPTMR timebase. Timestamps have 1 us units;
+//! long alarm without resetting the LPTMR timebase. Timestamps have 1 us units
+//! with approximately 61 us resolution from FRO16K;
 //! alarm resolution is approximately 1 ms, not 1 us. There is no 1 ms polling IRQ.
-//! Default clocks keep the 1 MHz timebase and WAKETIMER's FRO16K source enabled.
+//! Default clocks keep the FRO16K outputs for LPTMR and WAKETIMER enabled.
 //! This example uses normal executor sleep, not Power Down or Deep Power Down.
 //! MCXA287 uses the same peripheral layout; MCXA577 still needs board validation.
 

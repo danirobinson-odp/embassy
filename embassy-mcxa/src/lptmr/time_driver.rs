@@ -1,9 +1,10 @@
-//! Continuous 1 MHz LPTMR timekeeping with one-shot WAKETIMER alarms.
+//! Continuous FRO16K LPTMR timekeeping with one-shot WAKETIMER alarms.
 //!
 //! LPTMR is never stopped while scheduling. Its compare cannot be freely
 //! rewritten while running (MCXA2 35.3.6, MCXA5 40.3.6), so WAKETIMER handles
 //! both queue deadlines and half-wrap maintenance with no periodic polling.
-//! Alarms have approximately millisecond resolution; timestamps remain in us.
+//! The 16,384 Hz timebase keeps counting in Power Down. Timestamps remain in us
+//! with approximately 61 us resolution; alarms have millisecond resolution.
 //! Deadlines crossed while processing the queue are serviced by the next alarm.
 //! If stopping an alarm fails, leave it masked and retry on the next scheduling
 //! call. Queued timers and wrap maintenance may stall until a retry succeeds.
@@ -17,24 +18,32 @@ use embassy_time_driver::Driver;
 use embassy_time_queue_utils::Queue;
 
 use super::{Config, configure, read_counter};
+use crate::clocks::periph_helpers::LptmrClockSel;
 use crate::clocks::{PoweredClock, with_clocks};
 use crate::interrupt::InterruptExt;
 use crate::pac::lptmr::{Ten, Tfc};
 use crate::{interrupt, pac};
 
+const COUNTER_HZ: u64 = 16_384;
 const HALF_WRAP: u64 = 1 << 31;
+const HALF_WRAP_US: u64 = counter_micros(HALF_WRAP);
 // The chip clocking tables specify 16.384 kHz, divided by the wake timer's
 // 4-bit ripple counter (MCXA2 21.3.2/30.5.1.2, MCXA5 28.3.2/37.5.1.2).
-const ALARM_HZ: u64 = 16_384 / 16;
+const ALARM_HZ: u64 = COUNTER_HZ / 16;
 // Software fault policy, not a hardware timing guarantee: the manuals specify
 // no maximum clear-propagation time. Bound read pairs even if the clock fails.
 const STOP_ALARM_ATTEMPTS: u32 = 1_000_000;
 
 fn alarm_ticks(delta: u64) -> u32 {
-    // delta is bounded by HALF_WRAP before conversion, so this fits in u32.
+    // delta is bounded by HALF_WRAP_US before conversion, so this fits in u32.
     // Add a tick for the unknown phase of the continuously enabled divider.
     // Only the LPTMR timestamp decides when a queued waker is actually due.
     (delta * ALARM_HZ).div_ceil(1_000_000) as u32 + 1
+}
+
+const fn counter_micros(ticks: u64) -> u64 {
+    // Convert the total count, not individual deltas, to retain fractional ticks.
+    (ticks / COUNTER_HZ) * 1_000_000 + (ticks % COUNTER_HZ) * 1_000_000 / COUNTER_HZ
 }
 
 fn stop_alarm() -> bool {
@@ -75,7 +84,7 @@ fn stop_alarm() -> bool {
 struct State {
     initialized: bool,
     alarm_failed: bool,
-    time: u64,
+    counter_ticks: u64,
     queue: Queue,
 }
 
@@ -85,8 +94,8 @@ fn extend(previous: u64, counter: u32) -> u64 {
 
 impl State {
     fn now(&mut self) -> u64 {
-        self.time = extend(self.time, read_counter());
-        self.time
+        self.counter_ticks = extend(self.counter_ticks, read_counter());
+        counter_micros(self.counter_ticks)
     }
 
     fn update_alarm(&mut self) {
@@ -103,7 +112,7 @@ impl State {
         let now = self.now();
         // Even an empty queue needs an observation well before a full LPTMR
         // wrap. Bound the u64::MAX queue sentinel before converting to ticks.
-        let delta = next.saturating_sub(now).min(HALF_WRAP);
+        let delta = next.saturating_sub(now).min(HALF_WRAP_US);
         let count = alarm_ticks(delta);
         pac::WAKETIMER0.wake_timer_cnt().write(|w| w.set_wake_cnt(count));
         pac::WAKETIMER0.wake_timer_ctrl().write(|w| {
@@ -119,7 +128,7 @@ embassy_time_driver::time_driver_impl!(static DRIVER: LptmrTimeDriver = LptmrTim
     state: Mutex::new(RefCell::new(State {
         initialized: false,
         alarm_failed: false,
-        time: 0,
+        counter_ticks: 0,
         queue: Queue::new(),
     })),
 });
@@ -179,18 +188,19 @@ pub(crate) fn init(priority: interrupt::Priority) {
     })
     .expect("WAKETIMER time driver requires initialized clocks")
     .expect("WAKETIMER time driver requires FRO16K in its power domain");
-    assert_eq!(alarm_source, 16_384);
+    assert_eq!(alarm_source as u64, COUNTER_HZ);
     let parts = configure(Config {
         power: PoweredClock::AlwaysEnabled,
+        source: LptmrClockSel::Clk16K,
         ..Config::default()
     })
-    .expect("LPTMR time driver requires an always-enabled 1 MHz clock and bus clock >=2 MHz");
-    assert_eq!(parts.freq, 1_000_000);
+    .expect("LPTMR time driver requires FRO16K in VSYS and bus clock >=32768 Hz");
+    assert_eq!(parts.freq as u64, COUNTER_HZ);
     core::mem::forget(parts.wake_guard);
     pac::LPTMR0.cmr().write(|w| w.set_compare(u32::MAX));
     critical_section::with(|cs| {
         let mut state = DRIVER.state.borrow(cs).borrow_mut();
-        state.time = 0;
+        state.counter_ticks = 0;
         state.initialized = true;
         pac::LPTMR0.csr().write(|w| {
             w.set_tfc(Tfc::Tfc1);
@@ -202,5 +212,49 @@ pub(crate) fn init(priority: interrupt::Priority) {
     interrupt::WAKETIMER0.set_priority(priority);
     unsafe {
         interrupt::WAKETIMER0.enable();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counter_conversion_preserves_fractional_ticks_across_reads() {
+        let mut ticks = 0;
+        for counter in 1..=16_384 {
+            ticks = extend(ticks, counter);
+            assert_eq!(counter_micros(ticks), counter as u64 * 1_000_000 / COUNTER_HZ);
+        }
+        assert_eq!(counter_micros(ticks), 1_000_000);
+        assert_eq!(counter_micros(1), 61);
+        assert_eq!(counter_micros(16_383), 999_938);
+        assert_eq!(counter_micros(16_385), 1_000_061);
+    }
+
+    #[test]
+    fn counter_extension_keeps_time_monotonic_across_wrap() {
+        let before = u32::MAX as u64 - 1;
+        let after = extend(before, 1);
+        assert_eq!(after, (1_u64 << 32) + 1);
+        assert!(counter_micros(after) > counter_micros(before));
+        assert_eq!(counter_micros(1_u64 << 32), 262_144_000_000);
+    }
+
+    #[test]
+    fn conversion_does_not_multiply_the_full_counter_before_dividing() {
+        let ticks = 1_u64 << 48;
+        assert_eq!(counter_micros(ticks), 17_179_869_184_000_000);
+    }
+
+    #[test]
+    fn alarm_rounds_up_and_bounds_maintenance_before_counter_wrap() {
+        assert_eq!(alarm_ticks(0), 1);
+        assert_eq!(alarm_ticks(1), 2);
+        assert_eq!(alarm_ticks(1_000), 3);
+        assert_eq!(alarm_ticks(1_000_000), 1_025);
+        assert_eq!(HALF_WRAP_US, 131_072_000_000);
+        assert_eq!(alarm_ticks(HALF_WRAP_US), (1_u32 << 27) + 1);
+        assert!(alarm_ticks(HALF_WRAP_US) as u64 * 16 < (1_u64 << 32));
     }
 }
